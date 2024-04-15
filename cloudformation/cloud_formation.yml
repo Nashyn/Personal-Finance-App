@@ -1,0 +1,568 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation'
+
+Parameters:
+  TaxEmailParameter:
+    Type: String
+    Description: The email address where the tax notification will be sent.
+
+  FinanceEmailParameter:
+    Type: String
+    Description: The email address where the tax notification will be sent.
+
+Resources:
+  S3Bucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: 'financialdatabucket'
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: ['PUT', 'POST', 'DELETE', 'GET']
+            AllowedOrigins: ['*']
+
+  TaxDynamoDBTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: taxInformation
+      AttributeDefinitions:
+        - AttributeName: 'id'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'id'
+          KeyType: 'HASH'
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+   
+  FinanceDynamoDBTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: UserFinancialData
+      AttributeDefinitions:
+        - AttributeName: 'id'
+          AttributeType: 'S'
+      KeySchema:
+        - AttributeName: 'id'
+          KeyType: 'HASH'
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+
+  TaxNotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: 'tax-notification'
+
+  TaxNotificationSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Protocol: 'email'
+      Endpoint: !Ref TaxEmailParameter
+      TopicArn: !Ref TaxNotificationTopic      
+
+  FinanceNotificationTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: 'finance-notification'
+
+  FinanceNotificationSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Protocol: 'email'
+      Endpoint: !Ref FinanceEmailParameter
+      TopicArn: !Ref FinanceNotificationTopic   
+         
+  EC2Instance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      InstanceType: 't2.micro'
+      ImageId: 'ami-051f8a213df8bc089'
+      KeyName: 'project_keypair'
+      Tags:
+        - Key: Name
+          Value: Cloud-project
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          sudo yum update -y
+          sudo yum install docker -y
+          sudo systemctl enable docker
+          sudo systemctl start docker
+          sudo usermod -a -G docker ec2-user
+          newgrp docker << EONG
+          docker pull nisargchudasama/finance:latest
+          docker run -d -p 80:80 --name finance-app nisargchudasama/finance:latest
+          EONG          
+            
+  TaxCalculatorLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: 'tax-calculator'
+      Runtime: 'nodejs20.x'
+      Role: 'arn:aws:iam::851725385861:role/LabRole'
+      Handler: 'index.handler'
+      Code:
+        S3Bucket: 'cloudformation-zip-bucket'
+        S3Key: 'aws-tax-calculator.zip'
+      Timeout: 30
+      Environment:
+        Variables:
+          TAX_NOTIFICATION_TOPIC_ARN: !Ref TaxNotificationTopic
+
+  TaxCalculatorPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt TaxCalculatorLambdaFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 'apigateway.amazonaws.com'
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TaxCalculationApiGateway}/prod/GET/calculate-tax"
+    DependsOn:
+      - TaxCalculationDeployment
+      - TaxCalculatorLambdaFunction
+      
+  GetPresignedUrlLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: 'get-presignedurl'
+      Runtime: 'nodejs20.x'
+      Role: 'arn:aws:iam::851725385861:role/LabRole'
+      Handler: 'index.handler'
+      Code:
+        S3Bucket: 'cloudformation-zip-bucket'
+        S3Key: 'aws-presigned-url.zip'
+      Timeout: 30   
+
+  GetPresignedUrlPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt GetPresignedUrlLambdaFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 'apigateway.amazonaws.com'
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserFinanceApiGateway}/prod/POST/get-presigned-url"
+    DependsOn:
+      - UserFinanceDeployment
+      - GetPresignedUrlLambdaFunction
+
+  PersonalFinanceLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: 'personal-finance'
+      Runtime: 'nodejs20.x'
+      Role: 'arn:aws:iam::851725385861:role/LabRole'
+      Handler: 'index.handler'
+      Code:
+        S3Bucket: 'cloudformation-zip-bucket'
+        S3Key: 'aws-financialdashboard.zip'
+      Timeout: 30    
+      Environment:
+        Variables:
+          FINANCE_NOTIFICATION_TOPIC_ARN: !Ref FinanceNotificationTopic
+
+  PersonalFinancePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt PersonalFinanceLambdaFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 'apigateway.amazonaws.com'
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserFinanceApiGateway}/prod/POST/upload"
+    DependsOn:
+      - PersonalFinanceDeployment
+      - PersonalFinanceLambdaFunction
+
+  InvokeUrlLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: 'get-invokeurl'
+      Runtime: 'nodejs20.x'
+      Role: 'arn:aws:iam::851725385861:role/LabRole'
+      Handler: 'index.handler'
+      Code:
+        S3Bucket: 'cloudformation-zip-bucket'
+        S3Key: 'aws-invoke-url.zip'
+      Timeout: 30  
+
+  InvokeUrlPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt InvokeUrlLambdaFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: 'events.amazonaws.com'
+      SourceArn: !GetAtt CloudFormationUpdateRule.Arn
+    DependsOn:
+      - InvokeUrlLambdaFunction
+
+  CloudFormationUpdateRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Name: 'cloudformation-stack-update-complete'
+      ScheduleExpression: 'rate(1 minute)'
+      Targets:
+        - Arn: !GetAtt InvokeUrlLambdaFunction.Arn
+          Id: 'TargetFunction'
+    DependsOn:
+      - InvokeUrlLambdaFunction          
+
+  TaxCalculationApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: tax-calculation
+
+  TaxCalculationResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TaxCalculationApiGateway
+      ParentId: !GetAtt TaxCalculationApiGateway.RootResourceId
+      PathPart: 'calculate-tax'
+
+  TaxCalculationGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TaxCalculationApiGateway
+      ResourceId: !Ref TaxCalculationResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TaxCalculatorLambdaFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+          - StatusCode: 500
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            "application/json": "Empty"
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            "application/json": "Error"              
+
+  TaxCalculationOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TaxCalculationApiGateway
+      ResourceId: !Ref TaxCalculationResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              'application/json': ''
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            'application/json': 'Empty'
+
+  TaxCalculationDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - TaxCalculationGetMethod
+    Properties:
+      RestApiId: !Ref TaxCalculationApiGateway
+      StageName: prod
+
+  UserFinanceApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: userfinancedata  
+
+  UserFinanceResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UserFinanceApiGateway
+      ParentId: !GetAtt UserFinanceApiGateway.RootResourceId
+      PathPart: 'get-presigned-url'
+
+  UserFinancePostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UserFinanceApiGateway
+      ResourceId: !Ref  UserFinanceResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      RequestModels:
+        "application/json": "Empty"      
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetPresignedUrlLambdaFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+          - StatusCode: 500
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"   
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            "application/json": "Empty"
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            "application/json": "Error"      
+
+  UserFinanceOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UserFinanceApiGateway
+      ResourceId: !Ref UserFinanceResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              'application/json': ''
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            'application/json': 'Empty'
+
+  UserFinanceDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - UserFinancePostMethod
+    Properties:
+      RestApiId: !Ref UserFinanceApiGateway
+      StageName: prod
+
+  PersonalFinanceResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref UserFinanceApiGateway
+      ParentId: !GetAtt UserFinanceApiGateway.RootResourceId
+      PathPart: 'upload'
+
+  PersonalFinancePostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UserFinanceApiGateway
+      ResourceId: !Ref  PersonalFinanceResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      RequestModels:
+        "application/json": "Empty"      
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PersonalFinanceLambdaFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+          - StatusCode: 500
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            "application/json": "Empty"
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            "application/json": "Error"      
+
+  PersonalFinanceOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref UserFinanceApiGateway
+      ResourceId: !Ref PersonalFinanceResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              'application/json': ''
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            'application/json': 'Empty'
+
+  PersonalFinanceDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PersonalFinancePostMethod
+    Properties:
+      RestApiId: !Ref UserFinanceApiGateway
+      StageName: prod
+
+  InvokeUrlApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: invokeurl
+
+  InvokeUrlResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref InvokeUrlApiGateway
+      ParentId: !GetAtt InvokeUrlApiGateway.RootResourceId
+      PathPart: 'invoke-url'
+
+  InvokeUrlGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref InvokeUrlApiGateway
+      ResourceId: !Ref InvokeUrlResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${InvokeUrlLambdaFunction.Arn}/invocations'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+          - StatusCode: 500
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            "application/json": "Empty"
+        - StatusCode: 500
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            "application/json": "Error"      
+
+  InvokeUrlOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref InvokeUrlApiGateway
+      ResourceId: !Ref InvokeUrlResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              'application/json': ''
+        PassthroughBehavior: NEVER
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            'application/json': 'Empty'
+
+  InvokeUrlDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - InvokeUrlGetMethod
+    Properties:
+      RestApiId: !Ref InvokeUrlApiGateway
+      StageName: prod
+
+Outputs:
+  TaxCalculationApiInvokeURL:
+    Description: "Invoke URL for the TaxCalculationApi"
+    Value: !Sub "https://${TaxCalculationApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  UserFinanceApiInvokeURL:
+    Description: "Invoke URL for the UserFinanceApi"
+    Value: !Sub "https://${UserFinanceApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod"
+
+
+
+
+
+
+
+
+
