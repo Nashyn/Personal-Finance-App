@@ -23,7 +23,7 @@ Before you begin, ensure you have the following installed:
 
 Navigate to the frontend directory and install the required dependencies:
 
-```bash
+```
 cd frontend
 npm install
 ```
